@@ -22,6 +22,9 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 	nextAgentId = { current: 1 };
 	agents = new Map<number, AgentState>();
 	webviewView: vscode.WebviewView | undefined;
+	private disposed = false;
+	private webviewMessageDisposable: vscode.Disposable | null = null;
+	private webviewDisposeDisposable: vscode.Disposable | null = null;
 
 	// Per-agent timers
 	fileWatchers = new Map<number, fs.FSWatcher>();
@@ -54,12 +57,24 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 		persistAgents(this.agents, this.context);
 	};
 
+	private disposeWebviewBindings(): void {
+		this.webviewMessageDisposable?.dispose();
+		this.webviewMessageDisposable = null;
+		this.webviewDisposeDisposable?.dispose();
+		this.webviewDisposeDisposable = null;
+		this.webviewView = undefined;
+	}
+
 	resolveWebviewView(webviewView: vscode.WebviewView) {
+		if (this.disposed) return;
+
+		this.disposeWebviewBindings();
 		this.webviewView = webviewView;
 		webviewView.webview.options = { enableScripts: true };
 		webviewView.webview.html = getWebviewContent(webviewView.webview, this.extensionUri);
 
-		webviewView.webview.onDidReceiveMessage(async (message) => {
+		this.webviewMessageDisposable = webviewView.webview.onDidReceiveMessage(async (message) => {
+			if (this.disposed) return;
 			if (message.type === 'openCopilot' || message.type === 'openClaude') {
 				// Support both old and new message type for compatibility
 				await openCopilotChat(
@@ -237,6 +252,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 				}
 			}
 		});
+
+		this.webviewDisposeDisposable = webviewView.onDidDispose(() => {
+			this.disposeWebviewBindings();
+		});
 	}
 
 	/** Export current saved layout to webview-ui/public/assets/default-layout.json (dev utility) */
@@ -258,14 +277,20 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private startLayoutWatcher(): void {
+		if (this.disposed) return;
 		if (this.layoutWatcher) return;
 		this.layoutWatcher = watchLayoutFile((layout) => {
+			if (this.disposed) return;
 			console.log('[Pixel Agents] External layout change — pushing to webview');
 			this.webview?.postMessage({ type: 'layoutLoaded', layout });
 		});
 	}
 
 	dispose() {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.disposeWebviewBindings();
+
 		this.layoutWatcher?.dispose();
 		this.layoutWatcher = null;
 		for (const id of [...this.agents.keys()]) {
