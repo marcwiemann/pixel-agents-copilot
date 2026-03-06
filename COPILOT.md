@@ -1,6 +1,6 @@
 # Pixel Agents — Compressed Reference
 
-VS Code extension with embedded React webview: pixel art office where AI agents (Claude Code terminals) are animated characters.
+VS Code extension with embedded React webview: pixel art office where AI agents (GitHub Copilot Chat sessions) are animated characters.
 
 ## Architecture
 
@@ -10,10 +10,10 @@ src/                          — Extension backend (Node.js, VS Code API)
   extension.ts                — Entry: activate(), deactivate()
   PixelAgentsViewProvider.ts   — WebviewViewProvider, message dispatch, asset loading
   assetLoader.ts              — PNG parsing, sprite conversion, catalog building, default layout loading
-  agentManager.ts             — Terminal lifecycle: launch, remove, restore, persist
+  agentManager.ts             — Session lifecycle: open Copilot Chat, remove, restore, persist
+  copilotSessionParser.ts     — JSON session parsing: tool invocations → webview messages
   layoutPersistence.ts        — User-level layout file I/O (~/.pixel-agents/layout.json), migration, cross-window watching
-  fileWatcher.ts              — fs.watch + polling, readNewLines, /clear detection, terminal adoption
-  transcriptParser.ts         — JSONL parsing: tool_use/tool_result → webview messages
+  fileWatcher.ts              — fs.watch + polling, readSessionFile, chatSessions directory scanner
   timerManager.ts             — Waiting/permission timer logic
   types.ts                    — Shared interfaces (AgentState, PersistedAgent)
 
@@ -71,25 +71,61 @@ scripts/                      — 7-stage asset extraction pipeline
 
 ## Core Concepts
 
-**Vocabulary**: Terminal = VS Code terminal running Claude. Session = JSONL conversation file. Agent = webview character bound 1:1 to a terminal.
+**Vocabulary**: Session = Copilot Chat session JSON file. Agent = webview character bound 1:1 to a session.
 
-**Extension ↔ Webview**: `postMessage` protocol. Key messages: `openClaude`, `agentCreated/Closed`, `focusAgent`, `agentToolStart/Done/Clear`, `agentStatus`, `existingAgents`, `layoutLoaded`, `furnitureAssetsLoaded`, `floorTilesLoaded`, `wallTilesLoaded`, `saveLayout`, `saveAgentSeats`, `exportLayout`, `importLayout`, `settingsLoaded`, `setSoundEnabled`.
+**Extension ↔ Webview**: `postMessage` protocol. Key messages: `openCopilot`, `agentCreated/Closed`, `focusAgent`, `agentToolStart/Done/Clear`, `agentStatus`, `existingAgents`, `layoutLoaded`, `furnitureAssetsLoaded`, `floorTilesLoaded`, `wallTilesLoaded`, `saveLayout`, `saveAgentSeats`, `exportLayout`, `importLayout`, `settingsLoaded`, `setSoundEnabled`.
 
-**One-agent-per-terminal**: Each "+ Agent" click → new terminal (`claude --session-id <uuid>`) → immediate agent creation → 1s poll for `<uuid>.jsonl` → file watching starts.
+**One-agent-per-session**: Each "+ Agent" click → opens Copilot Chat panel → scans `chatSessions/` dir for new JSON file → file watching starts.
 
-**Terminal adoption**: Project-level 1s scan detects unknown JSONL files. If active terminal has no agent → adopt. If focused agent exists → reassign (`/clear` handling).
+**Session discovery**: `getCopilotSessionsDir()` scans all `workspaceStorage/<hash>/workspace.json` entries to find the one matching the current workspace path. Returns the corresponding `chatSessions/` directory. Scanning interval: 1s (`PROJECT_SCAN_INTERVAL_MS`).
 
 ## Agent Status Tracking
 
-JSONL transcripts at `~/.claude/projects/<project-hash>/<session-id>.jsonl`. Project hash = workspace path with `:`/`\`/`/` → `-`.
+Copilot session files at `~/Library/Application Support/Code/User/workspaceStorage/<workspace-hash>/chatSessions/<session-id>.json` (macOS). Linux: `~/.config/Code/...`. Windows: `%APPDATA%\Code\...`.
 
-**JSONL record types**: `assistant` (tool_use blocks or thinking), `user` (tool_result or text prompt), `system` with `subtype: "turn_duration"` (reliable turn-end signal), `progress` with `data.type`: `agent_progress` (sub-agent tool_use/tool_result forwarded to webview, non-exempt tools trigger permission timers), `bash_progress` (long-running Bash output — restarts permission timer to confirm tool is executing), `mcp_progress` (MCP tool status — same timer restart logic). Also observed but not tracked: `file-history-snapshot`, `queue-operation`.
+**Session JSON structure**:
+```json
+{
+  "requests": [
+    {
+      "requestId": "...",
+      "message": { "text": "user prompt" },
+      "response": [
+        { "value": "text chunk" },
+        { "kind": "prepareToolInvocation", "toolName": "copilot_readFile" },
+        {
+          "kind": "toolInvocationSerialized",
+          "toolId": "copilot_readFile",
+          "toolCallId": "...",
+          "invocationMessage": { "value": "Reading [file], lines 1 to 50" },
+          "isComplete": true,
+          "isConfirmed": true
+        }
+      ],
+      "subRequests": [ /* sub-agent requests, same structure */ ]
+    }
+  ]
+}
+```
 
-**File watching**: Hybrid `fs.watch` + 2s polling backup. Partial line buffering for mid-write reads. Tool done messages delayed 300ms to prevent flicker.
+**Diff detection**: `lastRequestCount` + `lastResponseChunkCount` on `AgentState`. File is re-read in full each poll; new chunks processed from `prevChunkCount` onwards. (Unlike Claude Code's JSONL which was append-only with byte offset tracking.)
 
-**Extension state per agent**: `id, terminalRef, projectDir, jsonlFile, fileOffset, lineBuffer, activeToolIds, activeToolStatuses, activeSubagentToolNames, isWaiting`.
+**File watching**: Hybrid `fs.watch` + stat-based `fs.watchFile` + 2s polling backup. Tool done messages delayed `TOOL_DONE_DELAY_MS` (300ms) to prevent flicker.
 
-**Persistence**: Agents persisted to `workspaceState` key `'pixel-agents.agents'` (includes palette/hueShift/seatId). **Layout persisted to `~/.pixel-agents/layout.json`** (user-level, shared across all VS Code windows/workspaces). `layoutPersistence.ts` handles all file I/O: `readLayoutFromFile()`, `writeLayoutToFile()` (atomic via `.tmp` + rename), `migrateAndLoadLayout()` (checks file → migrates old workspace state → falls back to bundled default), `watchLayoutFile()` (hybrid `fs.watch` + 2s polling for cross-window sync). On save, `markOwnWrite()` prevents the watcher from re-reading our own write. External changes push `layoutLoaded` to the webview; skipped if the editor has unsaved changes (last-save-wins). On webview ready: `restoreAgents()` matches persisted entries to live terminals. `nextAgentId`/`nextTerminalIndex` advanced past restored values. **Default layout**: When no saved layout file exists and no workspace state to migrate, a bundled `default-layout.json` is loaded from `assets/` and written to the file. If that also doesn't exist, `createDefaultLayout()` generates a basic office. To update the default: run "Pixel Agents: Export Layout as Default" from the command palette (writes current layout to `webview-ui/public/assets/default-layout.json`), then rebuild. **Export/Import**: Settings modal offers Export Layout (save dialog → JSON file) and Import Layout (open dialog → validates `version: 1` + `tiles` array → writes to layout file + pushes `layoutLoaded` to webview).
+**Tool name mapping** (in `copilotSessionParser.ts`):
+
+| Copilot Tool | Display |
+|---|---|
+| `copilot_readFile` | Reading {file} |
+| `copilot_replaceString` / `copilot_editFile` | Editing {file} |
+| `copilot_writeFile` / `copilot_createFile` | Writing {file} |
+| `copilot_findTextInFiles` | Searching code |
+| `run_in_terminal` / `copilot_runCommand` | Running: {cmd} |
+| `copilot_runTests` | Running tests |
+
+**Extension state per agent**: `id, sessionFile, sessionsDir, lastRequestCount, lastResponseChunkCount, activeToolIds, activeToolStatuses, activeToolNames, activeSubagentToolIds, activeSubagentToolNames, isWaiting`.
+
+**Persistence**: Agents persisted to `workspaceState` key `'pixel-agents.copilot-agents'` (includes palette/hueShift/seatId). **Layout persisted to `~/.pixel-agents/layout.json`** (user-level, shared across all VS Code windows/workspaces).
 
 ## Office UI
 
@@ -97,11 +133,11 @@ JSONL transcripts at `~/.claude/projects/<project-hash>/<session-id>.jsonl`. Pro
 
 **UI styling**: Pixel art aesthetic — all overlays use sharp corners (`borderRadius: 0`), solid backgrounds (`#1e1e2e`), `2px solid` borders, hard offset shadows (`2px 2px 0px #0a0a14`, no blur). CSS variables defined in `index.css` `:root` (`--pixel-bg`, `--pixel-border`, `--pixel-accent`, etc.). Pixel font: FS Pixel Sans (`webview-ui/src/fonts/`), loaded via `@font-face` in `index.css`, applied globally.
 
-**Characters**: FSM states — active (pathfind to seat, typing/reading animation by tool type), idle (wander randomly with BFS, return to seat for rest after `wanderLimit` moves). 4-directional sprites, left = flipped right. Tool animations: typing (Write/Edit/Bash/Task) vs reading (Read/Grep/Glob/WebFetch). Sitting offset: characters shift down 6px when in TYPE state so they visually sit in their chair. Z-sort uses `ch.y + TILE_SIZE/2 + 0.5` so characters render in front of same-row furniture (chairs) but behind furniture at lower rows (desks, bookshelves). Chair z-sorting: non-back chairs use `zY = (row+1)*TILE_SIZE` (capped to first row) so characters at any seat tile render in front; back-facing chairs use `zY = (row+1)*TILE_SIZE + 1` so the chair back renders in front of the character. Chair tiles are blocked for all characters except their own assigned seat (per-character pathfinding via `withOwnSeatUnblocked`). **Diverse palette assignment**: `pickDiversePalette()` counts palettes of current non-sub-agent characters; picks randomly from least-used palette(s). First 6 agents each get a unique skin; beyond 6, skins repeat with a random hue shift (45–315°) via `adjustSprite()`. Character stores `palette` (0-5) + `hueShift` (degrees). Sprite cache keyed by `"palette:hueShift"`.
+**Characters**: FSM states — active (pathfind to seat, typing/reading animation by tool type), idle (wander randomly with BFS, return to seat for rest after `wanderLimit` moves). 4-directional sprites, left = flipped right. Tool animations: typing (Write/Edit/Bash/Run) vs reading (Read/Search/List). Sitting offset: characters shift down 6px when in TYPE state so they visually sit in their chair. Z-sort uses `ch.y + TILE_SIZE/2 + 0.5` so characters render in front of same-row furniture (chairs) but behind furniture at lower rows (desks, bookshelves). Chair z-sorting: non-back chairs use `zY = (row+1)*TILE_SIZE` (capped to first row) so characters at any seat tile render in front; back-facing chairs use `zY = (row+1)*TILE_SIZE + 1` so the chair back renders in front of the character. Chair tiles are blocked for all characters except their own assigned seat (per-character pathfinding via `withOwnSeatUnblocked`). **Diverse palette assignment**: `pickDiversePalette()` counts palettes of current non-sub-agent characters; picks randomly from least-used palette(s). First 6 agents each get a unique skin; beyond 6, skins repeat with a random hue shift (45–315°) via `adjustSprite()`. Character stores `palette` (0-5) + `hueShift` (degrees). Sprite cache keyed by `"palette:hueShift"`.
 
 **Spawn/despawn effect**: Matrix-style digital rain animation (0.3s). 16 vertical columns sweep top-to-bottom with staggered timing (per-column random seeds). Spawn: green rain reveals character pixels behind the sweep. Despawn: character pixels consumed by green rain trails. `matrixEffect` field on Character (`'spawn'`/`'despawn'`/`null`). Normal FSM is paused during effect. Despawning characters skip hit-testing. Restored agents (`existingAgents`) use `skipSpawnEffect: true` to appear instantly. `matrixEffect.ts` contains `renderMatrixEffect()` (per-pixel rendering) called from renderer instead of cached sprite draw.
 
-**Sub-agents**: Negative IDs (from -1 down). Created on `agentToolStart` with "Subtask:" prefix. Same palette + hueShift as parent. Click focuses parent terminal. Not persisted. Spawn at closest free seat to parent (Manhattan distance); fallback: closest walkable tile. **Sub-agent permission detection**: when a sub-agent runs a non-exempt tool, `startPermissionTimer` fires on the parent agent; if 5s elapse with no data, permission bubbles appear on both parent and sub-agent characters. `activeSubagentToolNames` (parentToolId → subToolId → toolName) tracks which sub-tools are active for the exempt check. Cleared when data resumes or Task completes.
+**Sub-agents**: Negative IDs (from -1 down). Created on `subagentToolStart` with "Subtask:" prefix. Same palette + hueShift as parent. Click focuses parent session. Not persisted. Spawn at closest free seat to parent (Manhattan distance); fallback: closest walkable tile. **Sub-agent permission detection**: when a sub-agent runs a non-exempt tool, `startPermissionTimer` fires on the parent agent; if 5s elapse with no data, permission bubbles appear on both parent and sub-agent characters.
 
 **Speech bubbles**: Permission ("..." amber dots) stays until clicked/cleared. Waiting (green checkmark) auto-fades 2s. Sprites in `spriteData.ts`.
 
@@ -159,16 +195,11 @@ Toggle via "Layout" button. Tools: SELECT (default), Floor paint, Wall paint, Er
 
 ## Condensed Lessons
 
-- `fs.watch` unreliable on Windows — always pair with polling backup
-- Partial line buffering essential for append-only file reads (carry unterminated lines)
+- `fs.watch` unreliable on macOS — always pair with polling backup
+- Full JSON file re-read each cycle (Copilot overwrites entire file); diff via `lastRequestCount`/`lastResponseChunkCount`
 - Delay `agentToolDone` 300ms to prevent React batching from hiding brief active states
-- **Idle detection** has two signals: (1) `system` + `subtype: "turn_duration"` — reliable for tool-using turns (~98%), emitted once per completed turn, handler clears all tool state as safety measure. (2) Text-idle timer (`TEXT_IDLE_DELAY_MS = 5s`) — for text-only turns where `turn_duration` is never emitted. Only starts when `hadToolsInTurn` is false (no tools used yet in this turn); if any tool_use arrives, `hadToolsInTurn` becomes true and the timer is suppressed for the rest of the turn. Reset on new user prompt or `turn_duration`. Cancelled by ANY new JSONL data arriving in `readNewLines`. Only fires after 5s of complete file silence
-- User prompt `content` can be string (text) or array (tool_results) — handle both
-- `/clear` creates NEW JSONL file (old file just stops)
-- `--output-format stream-json` needs non-TTY stdin — can't use with VS Code terminals
-- Hook-based IPC failed (hooks captured at startup, env vars don't propagate). JSONL watching works
-- PNG→SpriteData: pngjs for RGBA buffer, alpha threshold 128
-- OfficeCanvas selection changes are imperative (`editorState.selectedFurnitureUid`); must call `onEditorSelectionChange()` to trigger React re-render for toolbar
+- **Idle detection** has two signals: (1) all tools `isComplete: true` + text chunk present (no more tool_use → waiting). (2) Text-idle timer (`TEXT_IDLE_DELAY_MS = 5s`) — for text-only responses where no tools are used.
+- Copilot JSON session path requires scanning `workspaceStorage` entries and matching `workspace.json` `folder` field to current workspace URI
 
 ## Build & Dev
 
@@ -196,18 +227,11 @@ All magic numbers and strings are centralized — never add inline constants to 
 ## Key Patterns
 
 - `crypto.randomUUID()` works in VS Code extension host
-- Terminal `cwd` option sets working directory at creation
-- `/add-dir <path>` grants session access to additional directory
-
-## Windows-MCP (Desktop Automation)
-
-- `uvx --python 3.13 windows-mcp` — Tools: Snapshot, Click, Type, Scroll, Move, Shortcut, App, Shell, Wait, Scrape
-- Webview buttons show `(0,0)` in a11y tree — must use `Snapshot(use_vision=true)` for coordinates
-- Snap both VS Code windows side-by-side on SAME screen before clicking in Extension Dev Host
-- Reload extension via button on main VS Code window after building
+- Copilot session discovery: scan `workspaceStorage`, match `workspace.json` → find `chatSessions/` dir
 
 ## Key Decisions
 
 - `WebviewViewProvider` (not `WebviewPanel`) — lives in panel area alongside terminal
 - Inline esbuild problem matcher (no extra extension needed)
 - Webview is separate Vite project with own `node_modules`/`tsconfig`
+- No direct VS Code LM API used — purely observational file-watching approach (same as the original Claude Code approach)

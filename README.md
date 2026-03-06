@@ -2,21 +2,18 @@
 
 A VS Code extension that turns your AI coding agents into animated pixel art characters in a virtual office.
 
-Each Claude Code terminal you open spawns a character that walks around, sits at desks, and visually reflects what the agent is doing — typing when writing code, reading when searching files, waiting when it needs your attention.
-
-This is the source code for the free [Pixel Agents extension for VS Code](https://marketplace.visualstudio.com/items?itemName=pablodelucca.pixel-agents) — you can install it directly from the marketplace with the full furniture catalog included.
-
+Each GitHub Copilot Chat session you open spawns a character that walks around, sits at desks, and visually reflects what the agent is doing — typing when writing code, reading when searching files, waiting when it needs your attention.
 
 ![Pixel Agents screenshot](webview-ui/public/Screenshot.jpg)
 
 ## Features
 
-- **One agent, one character** — every Claude Code terminal gets its own animated character
+- **One agent, one character** — every Copilot Chat session gets its own animated character
 - **Live activity tracking** — characters animate based on what the agent is actually doing (writing, reading, running commands)
 - **Office layout editor** — design your office with floors, walls, and furniture using a built-in editor
 - **Speech bubbles** — visual indicators when an agent is waiting for input or needs permission
 - **Sound notifications** — optional chime when an agent finishes its turn
-- **Sub-agent visualization** — Task tool sub-agents spawn as separate characters linked to their parent
+- **Sub-agent visualization** — Copilot sub-agents spawn as separate characters linked to their parent
 - **Persistent layouts** — your office design is saved and shared across VS Code windows
 - **Diverse characters** — 6 diverse characters. These are based on the amazing work of [JIK-A-4, Metro City](https://jik-a-4.itch.io/metrocity-free-topdown-character-pack).
 
@@ -27,7 +24,7 @@ This is the source code for the free [Pixel Agents extension for VS Code](https:
 ## Requirements
 
 - VS Code 1.109.0 or later
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and configured
+- [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) extension installed and signed in
 
 ## Getting Started
 
@@ -48,8 +45,8 @@ Then press **F5** in VS Code to launch the Extension Development Host.
 ### Usage
 
 1. Open the **Pixel Agents** panel (it appears in the bottom panel area alongside your terminal)
-2. Click **+ Agent** to spawn a new Claude Code terminal and its character
-3. Start coding with Claude — watch the character react in real time
+2. Click **+ Agent** to open a new GitHub Copilot Chat session
+3. Start coding with Copilot — watch the character react in real time
 4. Click a character to select it, then click a seat to reassign it
 5. Click **Layout** to open the office editor and customize your space
 
@@ -75,13 +72,11 @@ This is the only part of the project that is not freely available. The tileset i
 npm run import-tileset
 ```
 
-Fair warning: the import pipeline is not exactly straightforward — the out-of-the-box tileset assets aren't the easiest to work with, and while I've done my best to make the process as smooth as possible, it may require some manual tweaking. If you have experience creating pixel art office assets and would like to contribute freely usable tilesets for the community, that would be hugely appreciated.
-
 The extension will still work without the tileset — you'll get the default characters and basic layout, but the full furniture catalog requires the imported assets.
 
 ## How It Works
 
-Pixel Agents watches Claude Code's JSONL transcript files to track what each agent is doing. When an agent uses a tool (like writing a file or running a command), the extension detects it and updates the character's animation accordingly. No modifications to Claude Code are needed — it's purely observational.
+Pixel Agents watches GitHub Copilot's chat session files to track what each agent is doing. Copilot Chat stores session data as JSON files in VS Code's `workspaceStorage`. When Copilot uses a tool (like reading a file or running a command), the extension detects it and updates the character's animation accordingly. No modifications to Copilot are needed — it's purely observational.
 
 The webview runs a lightweight game loop with canvas rendering, BFS pathfinding, and a character state machine (idle → walk → type/read). Everything is pixel-perfect at integer zoom levels.
 
@@ -92,22 +87,19 @@ The webview runs a lightweight game loop with canvas rendering, BFS pathfinding,
 
 ## Known Limitations
 
-- **Agent-terminal sync** — the way agents are connected to Claude Code terminal instances is not super robust and sometimes desyncs, especially when terminals are rapidly opened/closed or restored across sessions.
-- **Heuristic-based status detection** — Claude Code's JSONL transcript format does not provide clear signals for when an agent is waiting for user input or when it has finished its turn. The current detection is based on heuristics (idle timers, turn-duration events) and often misfires — agents may briefly show the wrong status or miss transitions.
-- **Windows-only testing** — the extension has only been tested on Windows 11. It may work on macOS or Linux, but there could be unexpected issues with file watching, paths, or terminal behavior on those platforms.
+- **Session detection** — the extension discovers Copilot sessions by scanning VS Code's `workspaceStorage` directory. There can be a ~1-2 second delay between opening a chat and the character appearing.
+- **Heuristic-based status detection** — Copilot's session JSON format does not provide a definitive "turn ended" signal. Status detection is based on heuristics (idle timers, tool completion events) and may occasionally misfire.
+- **macOS/Linux only tested** — `workspaceStorage` paths are resolved for macOS, Linux, and Windows, but the extension has primarily been tested on macOS.
 
 ## Roadmap
 
-There are several areas where contributions would be very welcome:
-
-- **Improve agent-terminal reliability** — more robust connection and sync between characters and Claude Code instances
-- **Better status detection** — find or propose clearer signals for agent state transitions (waiting, done, permission needed)
-- **Community assets** — freely usable pixel art tilesets or characters that anyone can use without purchasing third-party assets
+- **Improve session reliability** — more robust connection and sync between characters and Copilot sessions
+- **Better status detection** — clearer signals for agent state transitions (waiting, done, permission needed)
+- **Community assets** — freely usable pixel art tilesets or characters
 - **Agent creation and definition** — define agents with custom skills, system prompts, names, and skins before launching them
-- **Desks as directories** — click on a desk to select a working directory, drag and drop agents or click-to-assign to move them to specific desks/projects
-- **Claude Code agent teams** — native support for [agent teams](https://code.claude.com/docs/en/agent-teams), visualizing multi-agent coordination and communication
+- **Desks as directories** — click on a desk to select a working directory, drag agents to move them to specific desks/projects
+- **Multi-agent coordination** — visualizing Copilot sub-agent hierarchies and communication
 - **Git worktree support** — agents working in different worktrees to avoid conflict from parallel work on the same files
-- **Support for other agentic frameworks** — [OpenCode](https://github.com/nichochar/opencode), or really any kind of agentic experiment you'd want to run inside a pixel art interface (see [simile.ai](https://simile.ai/) for inspiration)
 
 If any of these interest you, feel free to open an issue or submit a PR.
 
