@@ -33,7 +33,7 @@ If you just want to use Pixel Agents, the easiest way is to download the [VS Cod
 ### Install from source
 
 ```bash
-git clone https://github.com/pablodelucca/pixel-agents.git
+git clone https://github.com/marcwiemann/pixel-agents-copilot.git
 cd pixel-agents
 npm install
 cd webview-ui && npm install && cd ..
