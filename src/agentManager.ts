@@ -4,104 +4,90 @@ import * as os from 'os';
 import * as vscode from 'vscode';
 import type { AgentState, PersistedAgent } from './types.js';
 import { cancelWaitingTimer, cancelPermissionTimer } from './timerManager.js';
-import { startFileWatching, readNewLines, ensureProjectScan } from './fileWatcher.js';
-import { JSONL_POLL_INTERVAL_MS, TERMINAL_NAME_PREFIX, WORKSPACE_KEY_AGENTS, WORKSPACE_KEY_AGENT_SEATS } from './constants.js';
+import { startFileWatching, ensureCopilotSessionScan } from './fileWatcher.js';
+import { JSONL_POLL_INTERVAL_MS, AGENT_NAME_PREFIX, WORKSPACE_KEY_AGENTS, WORKSPACE_KEY_AGENT_SEATS } from './constants.js';
 import { migrateAndLoadLayout } from './layoutPersistence.js';
 
-export function getProjectDirPath(cwd?: string): string | null {
-	const workspacePath = cwd || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+/**
+ * Find the VS Code workspaceStorage chatSessions directory for the current workspace.
+ * VS Code hashes the workspace URI to produce the storage folder name.
+ * We scan all workspaceStorage entries until we find one whose workspace.json matches.
+ */
+export function getCopilotSessionsDir(cwd?: string): string | null {
+	const workspacePath = cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 	if (!workspacePath) return null;
-	const dirName = workspacePath.replace(/[^a-zA-Z0-9-]/g, '-');
-	const projectDir = path.join(os.homedir(), '.claude', 'projects', dirName);
-	console.log(`[Pixel Agents] Project dir: ${workspacePath} → ${dirName}`);
-	return projectDir;
+
+	const storageRoot = path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'workspaceStorage');
+
+	// Also try Linux / Windows paths
+	const altStorageRoots = [
+		path.join(os.homedir(), '.config', 'Code', 'User', 'workspaceStorage'), // Linux
+		path.join(os.homedir(), 'AppData', 'Roaming', 'Code', 'User', 'workspaceStorage'), // Windows
+	];
+
+	const allRoots = [storageRoot, ...altStorageRoots];
+
+	for (const root of allRoots) {
+		if (!fs.existsSync(root)) continue;
+		try {
+			const entries = fs.readdirSync(root);
+			for (const entry of entries) {
+				const wsJsonPath = path.join(root, entry, 'workspace.json');
+				if (!fs.existsSync(wsJsonPath)) continue;
+				try {
+					const wsJson = JSON.parse(fs.readFileSync(wsJsonPath, 'utf-8')) as { folder?: string };
+					// The folder field is a file URI like 'file:///path/to/workspace'
+					const folderUri = wsJson.folder;
+					if (!folderUri) continue;
+					const decoded = decodeURIComponent(folderUri.replace(/^file:\/\//, ''));
+					if (decoded === workspacePath || decoded === workspacePath.replace(/\\/g, '/')) {
+						const sessionsDir = path.join(root, entry, 'chatSessions');
+						console.log(`[Pixel Agents] Found Copilot sessions dir: ${sessionsDir}`);
+						return sessionsDir;
+					}
+				} catch { /* malformed workspace.json */ }
+			}
+		} catch { /* can't read storageRoot */ }
+	}
+
+	console.log('[Pixel Agents] Could not find Copilot sessions dir for workspace:', workspacePath);
+	return null;
 }
 
-export async function launchNewTerminal(
+export async function openCopilotChat(
 	nextAgentIdRef: { current: number },
-	nextTerminalIndexRef: { current: number },
 	agents: Map<number, AgentState>,
-	activeAgentIdRef: { current: number | null },
-	knownJsonlFiles: Set<string>,
+	knownSessionFiles: Set<string>,
 	fileWatchers: Map<number, fs.FSWatcher>,
 	pollingTimers: Map<number, ReturnType<typeof setInterval>>,
 	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
 	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-	jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+	sessionPollTimers: Map<number, ReturnType<typeof setInterval>>,
 	projectScanTimerRef: { current: ReturnType<typeof setInterval> | null },
 	webview: vscode.Webview | undefined,
 	persistAgents: () => void,
 	folderPath?: string,
 ): Promise<void> {
-	const folders = vscode.workspace.workspaceFolders;
-	const cwd = folderPath || folders?.[0]?.uri.fsPath;
-	const isMultiRoot = !!(folders && folders.length > 1);
-	const idx = nextTerminalIndexRef.current++;
-	const terminal = vscode.window.createTerminal({
-		name: `${TERMINAL_NAME_PREFIX} #${idx}`,
-		cwd,
-	});
-	terminal.show();
+	// Open the GitHub Copilot Chat panel
+	await vscode.commands.executeCommand('workbench.action.chat.open');
 
-	const sessionId = crypto.randomUUID();
-	terminal.sendText(`claude --session-id ${sessionId}`);
-
-	const projectDir = getProjectDirPath(cwd);
-	if (!projectDir) {
-		console.log(`[Pixel Agents] No project dir, cannot track agent`);
+	const sessionsDir = getCopilotSessionsDir(folderPath);
+	if (!sessionsDir) {
+		console.log('[Pixel Agents] No Copilot sessions dir found');
 		return;
 	}
 
-	// Pre-register expected JSONL file so project scan won't treat it as a /clear file
-	const expectedFile = path.join(projectDir, `${sessionId}.jsonl`);
-	knownJsonlFiles.add(expectedFile);
+	// Ensure the chatSessions directory exists
+	if (!fs.existsSync(sessionsDir)) {
+		try { fs.mkdirSync(sessionsDir, { recursive: true }); } catch { /* ignore */ }
+	}
 
-	// Create agent immediately (before JSONL file exists)
-	const id = nextAgentIdRef.current++;
-	const folderName = isMultiRoot && cwd ? path.basename(cwd) : undefined;
-	const agent: AgentState = {
-		id,
-		terminalRef: terminal,
-		projectDir,
-		jsonlFile: expectedFile,
-		fileOffset: 0,
-		lineBuffer: '',
-		activeToolIds: new Set(),
-		activeToolStatuses: new Map(),
-		activeToolNames: new Map(),
-		activeSubagentToolIds: new Map(),
-		activeSubagentToolNames: new Map(),
-		isWaiting: false,
-		permissionSent: false,
-		hadToolsInTurn: false,
-		folderName,
-	};
-
-	agents.set(id, agent);
-	activeAgentIdRef.current = id;
-	persistAgents();
-	console.log(`[Pixel Agents] Agent ${id}: created for terminal ${terminal.name}`);
-	webview?.postMessage({ type: 'agentCreated', id, folderName });
-
-	ensureProjectScan(
-		projectDir, knownJsonlFiles, projectScanTimerRef, activeAgentIdRef,
-		nextAgentIdRef, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers,
-		webview, persistAgents,
+	// Start scanning for new session files
+	ensureCopilotSessionScan(
+		sessionsDir, knownSessionFiles, projectScanTimerRef,
+		nextAgentIdRef, agents, fileWatchers, pollingTimers,
+		waitingTimers, permissionTimers, webview, persistAgents,
 	);
-
-	// Poll for the specific JSONL file to appear
-	const pollTimer = setInterval(() => {
-		try {
-			if (fs.existsSync(agent.jsonlFile)) {
-				console.log(`[Pixel Agents] Agent ${id}: found JSONL file ${path.basename(agent.jsonlFile)}`);
-				clearInterval(pollTimer);
-				jsonlPollTimers.delete(id);
-				startFileWatching(id, agent.jsonlFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
-				readNewLines(id, agents, waitingTimers, permissionTimers, webview);
-			}
-		} catch { /* file may not exist yet */ }
-	}, JSONL_POLL_INTERVAL_MS);
-	jsonlPollTimers.set(id, pollTimer);
 }
 
 export function removeAgent(
@@ -111,16 +97,16 @@ export function removeAgent(
 	pollingTimers: Map<number, ReturnType<typeof setInterval>>,
 	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
 	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-	jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+	sessionPollTimers: Map<number, ReturnType<typeof setInterval>>,
 	persistAgents: () => void,
 ): void {
 	const agent = agents.get(agentId);
 	if (!agent) return;
 
-	// Stop JSONL poll timer
-	const jpTimer = jsonlPollTimers.get(agentId);
-	if (jpTimer) { clearInterval(jpTimer); }
-	jsonlPollTimers.delete(agentId);
+	// Stop session poll timer
+	const spTimer = sessionPollTimers.get(agentId);
+	if (spTimer) { clearInterval(spTimer); }
+	sessionPollTimers.delete(agentId);
 
 	// Stop file watching
 	fileWatchers.get(agentId)?.close();
@@ -128,7 +114,7 @@ export function removeAgent(
 	const pt = pollingTimers.get(agentId);
 	if (pt) { clearInterval(pt); }
 	pollingTimers.delete(agentId);
-	try { fs.unwatchFile(agent.jsonlFile); } catch { /* ignore */ }
+	try { fs.unwatchFile(agent.sessionFile); } catch { /* ignore */ }
 
 	// Cancel timers
 	cancelWaitingTimer(agentId, waitingTimers);
@@ -147,9 +133,8 @@ export function persistAgents(
 	for (const agent of agents.values()) {
 		persisted.push({
 			id: agent.id,
-			terminalName: agent.terminalRef.name,
-			jsonlFile: agent.jsonlFile,
-			projectDir: agent.projectDir,
+			sessionFile: agent.sessionFile,
+			sessionsDir: agent.sessionsDir,
 			folderName: agent.folderName,
 		});
 	}
@@ -159,38 +144,30 @@ export function persistAgents(
 export function restoreAgents(
 	context: vscode.ExtensionContext,
 	nextAgentIdRef: { current: number },
-	nextTerminalIndexRef: { current: number },
 	agents: Map<number, AgentState>,
-	knownJsonlFiles: Set<string>,
+	knownSessionFiles: Set<string>,
 	fileWatchers: Map<number, fs.FSWatcher>,
 	pollingTimers: Map<number, ReturnType<typeof setInterval>>,
 	waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
 	permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-	jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+	sessionPollTimers: Map<number, ReturnType<typeof setInterval>>,
 	projectScanTimerRef: { current: ReturnType<typeof setInterval> | null },
-	activeAgentIdRef: { current: number | null },
 	webview: vscode.Webview | undefined,
 	doPersist: () => void,
 ): void {
 	const persisted = context.workspaceState.get<PersistedAgent[]>(WORKSPACE_KEY_AGENTS, []);
 	if (persisted.length === 0) return;
 
-	const liveTerminals = vscode.window.terminals;
 	let maxId = 0;
-	let maxIdx = 0;
-	let restoredProjectDir: string | null = null;
+	let restoredSessionsDir: string | null = null;
 
 	for (const p of persisted) {
-		const terminal = liveTerminals.find(t => t.name === p.terminalName);
-		if (!terminal) continue;
-
 		const agent: AgentState = {
 			id: p.id,
-			terminalRef: terminal,
-			projectDir: p.projectDir,
-			jsonlFile: p.jsonlFile,
-			fileOffset: 0,
-			lineBuffer: '',
+			sessionFile: p.sessionFile,
+			sessionsDir: p.sessionsDir,
+			lastRequestCount: 0,
+			lastResponseChunkCount: 0,
 			activeToolIds: new Set(),
 			activeToolStatuses: new Map(),
 			activeToolNames: new Map(),
@@ -203,40 +180,29 @@ export function restoreAgents(
 		};
 
 		agents.set(p.id, agent);
-		knownJsonlFiles.add(p.jsonlFile);
-		console.log(`[Pixel Agents] Restored agent ${p.id} → terminal "${p.terminalName}"`);
+		knownSessionFiles.add(p.sessionFile);
+		console.log(`[Pixel Agents] Restored agent ${p.id} → ${path.basename(p.sessionFile)}`);
 
 		if (p.id > maxId) maxId = p.id;
-		// Extract terminal index from name like "Claude Code #3"
-		const match = p.terminalName.match(/#(\d+)$/);
-		if (match) {
-			const idx = parseInt(match[1], 10);
-			if (idx > maxIdx) maxIdx = idx;
-		}
+		restoredSessionsDir = p.sessionsDir;
 
-		restoredProjectDir = p.projectDir;
-
-		// Start file watching if JSONL exists, skipping to end of file
+		// Start file watching if session file exists
 		try {
-			if (fs.existsSync(p.jsonlFile)) {
-				const stat = fs.statSync(p.jsonlFile);
-				agent.fileOffset = stat.size;
-				startFileWatching(p.id, p.jsonlFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
+			if (fs.existsSync(p.sessionFile)) {
+				startFileWatching(p.id, p.sessionFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
 			} else {
 				// Poll for the file to appear
 				const pollTimer = setInterval(() => {
 					try {
-						if (fs.existsSync(agent.jsonlFile)) {
-							console.log(`[Pixel Agents] Restored agent ${p.id}: found JSONL file`);
+						if (fs.existsSync(agent.sessionFile)) {
+							console.log(`[Pixel Agents] Restored agent ${p.id}: found session file`);
 							clearInterval(pollTimer);
-							jsonlPollTimers.delete(p.id);
-							const stat = fs.statSync(agent.jsonlFile);
-							agent.fileOffset = stat.size;
-							startFileWatching(p.id, agent.jsonlFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
+							sessionPollTimers.delete(p.id);
+							startFileWatching(p.id, agent.sessionFile, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers, webview);
 						}
 					} catch { /* file may not exist yet */ }
 				}, JSONL_POLL_INTERVAL_MS);
-				jsonlPollTimers.set(p.id, pollTimer);
+				sessionPollTimers.set(p.id, pollTimer);
 			}
 		} catch { /* ignore errors during restore */ }
 	}
@@ -245,19 +211,15 @@ export function restoreAgents(
 	if (maxId >= nextAgentIdRef.current) {
 		nextAgentIdRef.current = maxId + 1;
 	}
-	if (maxIdx >= nextTerminalIndexRef.current) {
-		nextTerminalIndexRef.current = maxIdx + 1;
-	}
 
-	// Re-persist cleaned-up list (removes entries whose terminals are gone)
 	doPersist();
 
-	// Start project scan for /clear detection
-	if (restoredProjectDir) {
-		ensureProjectScan(
-			restoredProjectDir, knownJsonlFiles, projectScanTimerRef, activeAgentIdRef,
-			nextAgentIdRef, agents, fileWatchers, pollingTimers, waitingTimers, permissionTimers,
-			webview, doPersist,
+	// Start session scan for new files
+	if (restoredSessionsDir) {
+		ensureCopilotSessionScan(
+			restoredSessionsDir, knownSessionFiles, projectScanTimerRef,
+			nextAgentIdRef, agents, fileWatchers, pollingTimers,
+			waitingTimers, permissionTimers, webview, doPersist,
 		);
 	}
 }

@@ -2,11 +2,13 @@ import type * as vscode from 'vscode';
 
 export interface AgentState {
 	id: number;
-	terminalRef: vscode.Terminal;
-	projectDir: string;
-	jsonlFile: string;
-	fileOffset: number;
-	lineBuffer: string;
+	/** The Copilot chat session JSON file being watched */
+	sessionFile: string;
+	/** Dir containing the chatSessions folder */
+	sessionsDir: string;
+	/** Last read state for diffing the JSON file */
+	lastRequestCount: number;
+	lastResponseChunkCount: number;
 	activeToolIds: Set<string>;
 	activeToolStatuses: Map<string, string>;
 	activeToolNames: Map<string, string>;
@@ -21,9 +23,15 @@ export interface AgentState {
 
 export interface PersistedAgent {
 	id: number;
-	terminalName: string;
-	jsonlFile: string;
-	projectDir: string;
+	sessionFile: string;
+	sessionsDir: string;
 	/** Workspace folder name (only set for multi-root workspaces) */
 	folderName?: string;
+}
+
+/** A synthetic "terminal ref" for copilot sessions — just opens the chat panel */
+export interface CopilotSessionRef {
+	readonly name: string;
+	show(): void;
+	dispose(): void;
 }

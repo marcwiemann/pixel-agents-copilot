@@ -5,7 +5,7 @@ import { vscode } from '../vscodeApi.js'
 
 interface BottomToolbarProps {
   isEditMode: boolean
-  onOpenClaude: () => void
+  onOpenCopilot: () => void
   onToggleEditMode: () => void
   isDebugMode: boolean
   onToggleDebugMode: () => void
@@ -46,7 +46,7 @@ const btnActive: React.CSSProperties = {
 
 export function BottomToolbar({
   isEditMode,
-  onOpenClaude,
+  onOpenCopilot,
   onToggleEditMode,
   isDebugMode,
   onToggleDebugMode,
@@ -76,13 +76,13 @@ export function BottomToolbar({
     if (hasMultipleFolders) {
       setIsFolderPickerOpen((v) => !v)
     } else {
-      onOpenClaude()
+      onOpenCopilot()
     }
   }
 
   const handleFolderSelect = (folder: WorkspaceFolder) => {
     setIsFolderPickerOpen(false)
-    vscode.postMessage({ type: 'openClaude', folderPath: folder.path })
+    vscode.postMessage({ type: 'openCopilot', folderPath: folder.path })
   }
 
   return (
@@ -154,9 +154,9 @@ export function BottomToolbar({
           isEditMode
             ? { ...btnActive }
             : {
-                ...btnBase,
-                background: hovered === 'edit' ? 'var(--pixel-btn-hover-bg)' : btnBase.background,
-              }
+              ...btnBase,
+              background: hovered === 'edit' ? 'var(--pixel-btn-hover-bg)' : btnBase.background,
+            }
         }
         title="Edit office layout"
       >
@@ -171,9 +171,9 @@ export function BottomToolbar({
             isSettingsOpen
               ? { ...btnActive }
               : {
-                  ...btnBase,
-                  background: hovered === 'settings' ? 'var(--pixel-btn-hover-bg)' : btnBase.background,
-                }
+                ...btnBase,
+                background: hovered === 'settings' ? 'var(--pixel-btn-hover-bg)' : btnBase.background,
+              }
           }
           title="Settings"
         >

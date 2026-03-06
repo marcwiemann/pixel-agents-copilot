@@ -4,15 +4,15 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentState } from './types.js';
 import {
-	launchNewTerminal,
+	openCopilotChat,
 	removeAgent,
 	restoreAgents,
 	persistAgents,
 	sendExistingAgents,
 	sendLayout,
-	getProjectDirPath,
+	getCopilotSessionsDir,
 } from './agentManager.js';
-import { ensureProjectScan } from './fileWatcher.js';
+import { ensureCopilotSessionScan } from './fileWatcher.js';
 import { loadFurnitureAssets, sendAssetsToWebview, loadFloorTiles, sendFloorTilesToWebview, loadWallTiles, sendWallTilesToWebview, loadCharacterSprites, sendCharacterSpritesToWebview, loadDefaultLayout } from './assetLoader.js';
 import { WORKSPACE_KEY_AGENT_SEATS, GLOBAL_KEY_SOUND_ENABLED } from './constants.js';
 import { writeLayoutToFile, readLayoutFromFile, watchLayoutFile } from './layoutPersistence.js';
@@ -20,7 +20,6 @@ import type { LayoutWatcher } from './layoutPersistence.js';
 
 export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 	nextAgentId = { current: 1 };
-	nextTerminalIndex = { current: 1 };
 	agents = new Map<number, AgentState>();
 	webviewView: vscode.WebviewView | undefined;
 
@@ -28,12 +27,11 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 	fileWatchers = new Map<number, fs.FSWatcher>();
 	pollingTimers = new Map<number, ReturnType<typeof setInterval>>();
 	waitingTimers = new Map<number, ReturnType<typeof setTimeout>>();
-	jsonlPollTimers = new Map<number, ReturnType<typeof setInterval>>();
+	sessionPollTimers = new Map<number, ReturnType<typeof setInterval>>();
 	permissionTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
-	// /clear detection: project-level scan for new JSONL files
-	activeAgentId = { current: null as number | null };
-	knownJsonlFiles = new Set<string>();
+	// Session scan state
+	knownSessionFiles = new Set<string>();
 	projectScanTimer = { current: null as ReturnType<typeof setInterval> | null };
 
 	// Bundled default layout (loaded from assets/default-layout.json)
@@ -62,27 +60,28 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 		webviewView.webview.html = getWebviewContent(webviewView.webview, this.extensionUri);
 
 		webviewView.webview.onDidReceiveMessage(async (message) => {
-			if (message.type === 'openClaude') {
-				await launchNewTerminal(
-					this.nextAgentId, this.nextTerminalIndex,
-					this.agents, this.activeAgentId, this.knownJsonlFiles,
+			if (message.type === 'openCopilot' || message.type === 'openClaude') {
+				// Support both old and new message type for compatibility
+				await openCopilotChat(
+					this.nextAgentId,
+					this.agents, this.knownSessionFiles,
 					this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
-					this.jsonlPollTimers, this.projectScanTimer,
+					this.sessionPollTimers, this.projectScanTimer,
 					this.webview, this.persistAgents,
 					message.folderPath as string | undefined,
 				);
 			} else if (message.type === 'focusAgent') {
-				const agent = this.agents.get(message.id);
-				if (agent) {
-					agent.terminalRef.show();
-				}
+				// Open Copilot Chat panel for this agent
+				await vscode.commands.executeCommand('workbench.action.chat.open');
 			} else if (message.type === 'closeAgent') {
-				const agent = this.agents.get(message.id);
-				if (agent) {
-					agent.terminalRef.dispose();
-				}
+				const id = message.id as number;
+				removeAgent(
+					id, this.agents,
+					this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
+					this.sessionPollTimers, this.persistAgents,
+				);
+				webviewView.webview.postMessage({ type: 'agentClosed', id });
 			} else if (message.type === 'saveAgentSeats') {
-				// Store seat assignments in a separate key (never touched by persistAgents)
 				console.log(`[Pixel Agents] saveAgentSeats:`, JSON.stringify(message.seats));
 				this.context.workspaceState.update(WORKSPACE_KEY_AGENT_SEATS, message.seats);
 			} else if (message.type === 'saveLayout') {
@@ -93,10 +92,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 			} else if (message.type === 'webviewReady') {
 				restoreAgents(
 					this.context,
-					this.nextAgentId, this.nextTerminalIndex,
-					this.agents, this.knownJsonlFiles,
+					this.nextAgentId,
+					this.agents, this.knownSessionFiles,
 					this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
-					this.jsonlPollTimers, this.projectScanTimer, this.activeAgentId,
+					this.sessionPollTimers, this.projectScanTimer,
 					this.webview, this.persistAgents,
 				);
 				// Send persisted settings to webview
@@ -112,122 +111,95 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 					});
 				}
 
-				// Ensure project scan runs even with no restored agents (to adopt external terminals)
-				const projectDir = getProjectDirPath();
+				// Ensure Copilot session scan is running
+				const sessionsDir = getCopilotSessionsDir();
 				const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				console.log('[Extension] workspaceRoot:', workspaceRoot);
-				console.log('[Extension] projectDir:', projectDir);
-				if (projectDir) {
-					ensureProjectScan(
-						projectDir, this.knownJsonlFiles, this.projectScanTimer, this.activeAgentId,
+				console.log('[Extension] sessionsDir:', sessionsDir);
+
+				if (sessionsDir) {
+					ensureCopilotSessionScan(
+						sessionsDir, this.knownSessionFiles, this.projectScanTimer,
 						this.nextAgentId, this.agents,
 						this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
 						this.webview, this.persistAgents,
 					);
-
-					// Load furniture assets BEFORE sending layout
-					(async () => {
-						try {
-							console.log('[Extension] Loading furniture assets...');
-							const extensionPath = this.extensionUri.fsPath;
-							console.log('[Extension] extensionPath:', extensionPath);
-
-							// Check bundled location first: extensionPath/dist/assets/
-							const bundledAssetsDir = path.join(extensionPath, 'dist', 'assets');
-							let assetsRoot: string | null = null;
-							if (fs.existsSync(bundledAssetsDir)) {
-								console.log('[Extension] Found bundled assets at dist/');
-								assetsRoot = path.join(extensionPath, 'dist');
-							} else if (workspaceRoot) {
-								// Fall back to workspace root (development or external assets)
-								console.log('[Extension] Trying workspace for assets...');
-								assetsRoot = workspaceRoot;
-							}
-
-							if (!assetsRoot) {
-								console.log('[Extension] ⚠️  No assets directory found');
-								if (this.webview) {
-									sendLayout(this.context, this.webview, this.defaultLayout);
-									this.startLayoutWatcher();
-								}
-								return;
-							}
-
-							console.log('[Extension] Using assetsRoot:', assetsRoot);
-
-							// Load bundled default layout
-							this.defaultLayout = loadDefaultLayout(assetsRoot);
-
-							// Load character sprites
-							const charSprites = await loadCharacterSprites(assetsRoot);
-							if (charSprites && this.webview) {
-								console.log('[Extension] Character sprites loaded, sending to webview');
-								sendCharacterSpritesToWebview(this.webview, charSprites);
-							}
-
-							// Load floor tiles
-							const floorTiles = await loadFloorTiles(assetsRoot);
-							if (floorTiles && this.webview) {
-								console.log('[Extension] Floor tiles loaded, sending to webview');
-								sendFloorTilesToWebview(this.webview, floorTiles);
-							}
-
-							// Load wall tiles
-							const wallTiles = await loadWallTiles(assetsRoot);
-							if (wallTiles && this.webview) {
-								console.log('[Extension] Wall tiles loaded, sending to webview');
-								sendWallTilesToWebview(this.webview, wallTiles);
-							}
-
-							const assets = await loadFurnitureAssets(assetsRoot);
-							if (assets && this.webview) {
-								console.log('[Extension] ✅ Assets loaded, sending to webview');
-								sendAssetsToWebview(this.webview, assets);
-							}
-						} catch (err) {
-							console.error('[Extension] ❌ Error loading assets:', err);
-						}
-						// Always send saved layout (or null for default)
-						if (this.webview) {
-							console.log('[Extension] Sending saved layout');
-							sendLayout(this.context, this.webview, this.defaultLayout);
-							this.startLayoutWatcher();
-						}
-					})();
-				} else {
-					// No project dir — still try to load floor/wall tiles, then send saved layout
-					(async () => {
-						try {
-							const ep = this.extensionUri.fsPath;
-							const bundled = path.join(ep, 'dist', 'assets');
-							if (fs.existsSync(bundled)) {
-								const distRoot = path.join(ep, 'dist');
-								this.defaultLayout = loadDefaultLayout(distRoot);
-								const cs = await loadCharacterSprites(distRoot);
-								if (cs && this.webview) {
-									sendCharacterSpritesToWebview(this.webview, cs);
-								}
-								const ft = await loadFloorTiles(distRoot);
-								if (ft && this.webview) {
-									sendFloorTilesToWebview(this.webview, ft);
-								}
-								const wt = await loadWallTiles(distRoot);
-								if (wt && this.webview) {
-									sendWallTilesToWebview(this.webview, wt);
-								}
-							}
-						} catch { /* ignore */ }
-						if (this.webview) {
-							sendLayout(this.context, this.webview, this.defaultLayout);
-							this.startLayoutWatcher();
-						}
-					})();
 				}
+
+				// Load furniture assets BEFORE sending layout
+				(async () => {
+					try {
+						console.log('[Extension] Loading furniture assets...');
+						const extensionPath = this.extensionUri.fsPath;
+						console.log('[Extension] extensionPath:', extensionPath);
+
+						// Check bundled location first: extensionPath/dist/assets/
+						const bundledAssetsDir = path.join(extensionPath, 'dist', 'assets');
+						let assetsRoot: string | null = null;
+						if (fs.existsSync(bundledAssetsDir)) {
+							console.log('[Extension] Found bundled assets at dist/');
+							assetsRoot = path.join(extensionPath, 'dist');
+						} else if (workspaceRoot) {
+							console.log('[Extension] Trying workspace for assets...');
+							assetsRoot = workspaceRoot;
+						}
+
+						if (!assetsRoot) {
+							console.log('[Extension] ⚠️  No assets directory found');
+							if (this.webview) {
+								sendLayout(this.context, this.webview, this.defaultLayout);
+								this.startLayoutWatcher();
+							}
+							return;
+						}
+
+						console.log('[Extension] Using assetsRoot:', assetsRoot);
+
+						// Load bundled default layout
+						this.defaultLayout = loadDefaultLayout(assetsRoot);
+
+						// Load character sprites
+						const charSprites = await loadCharacterSprites(assetsRoot);
+						if (charSprites && this.webview) {
+							console.log('[Extension] Character sprites loaded, sending to webview');
+							sendCharacterSpritesToWebview(this.webview, charSprites);
+						}
+
+						// Load floor tiles
+						const floorTiles = await loadFloorTiles(assetsRoot);
+						if (floorTiles && this.webview) {
+							console.log('[Extension] Floor tiles loaded, sending to webview');
+							sendFloorTilesToWebview(this.webview, floorTiles);
+						}
+
+						// Load wall tiles
+						const wallTiles = await loadWallTiles(assetsRoot);
+						if (wallTiles && this.webview) {
+							console.log('[Extension] Wall tiles loaded, sending to webview');
+							sendWallTilesToWebview(this.webview, wallTiles);
+						}
+
+						const assets = await loadFurnitureAssets(assetsRoot);
+						if (assets && this.webview) {
+							console.log('[Extension] ✅ Assets loaded, sending to webview');
+							sendAssetsToWebview(this.webview, assets);
+						}
+					} catch (err) {
+						console.error('[Extension] ❌ Error loading assets:', err);
+					}
+					// Always send saved layout (or null for default)
+					if (this.webview) {
+						console.log('[Extension] Sending saved layout');
+						sendLayout(this.context, this.webview, this.defaultLayout);
+						this.startLayoutWatcher();
+					}
+				})();
+
 				sendExistingAgents(this.agents, this.context, this.webview);
 			} else if (message.type === 'openSessionsFolder') {
-				const projectDir = getProjectDirPath();
-				if (projectDir && fs.existsSync(projectDir)) {
-					vscode.env.openExternal(vscode.Uri.file(projectDir));
+				const sessionsDir = getCopilotSessionsDir();
+				if (sessionsDir && fs.existsSync(sessionsDir)) {
+					vscode.env.openExternal(vscode.Uri.file(sessionsDir));
 				}
 			} else if (message.type === 'exportLayout') {
 				const layout = readLayoutFromFile();
@@ -262,34 +234,6 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 					vscode.window.showInformationMessage('Pixel Agents: Layout imported successfully.');
 				} catch {
 					vscode.window.showErrorMessage('Pixel Agents: Failed to read or parse layout file.');
-				}
-			}
-		});
-
-		vscode.window.onDidChangeActiveTerminal((terminal) => {
-			this.activeAgentId.current = null;
-			if (!terminal) return;
-			for (const [id, agent] of this.agents) {
-				if (agent.terminalRef === terminal) {
-					this.activeAgentId.current = id;
-					webviewView.webview.postMessage({ type: 'agentSelected', id });
-					break;
-				}
-			}
-		});
-
-		vscode.window.onDidCloseTerminal((closed) => {
-			for (const [id, agent] of this.agents) {
-				if (agent.terminalRef === closed) {
-					if (this.activeAgentId.current === id) {
-						this.activeAgentId.current = null;
-					}
-					removeAgent(
-						id, this.agents,
-						this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
-						this.jsonlPollTimers, this.persistAgents,
-					);
-					webviewView.webview.postMessage({ type: 'agentClosed', id });
 				}
 			}
 		});
@@ -328,7 +272,7 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 			removeAgent(
 				id, this.agents,
 				this.fileWatchers, this.pollingTimers, this.waitingTimers, this.permissionTimers,
-				this.jsonlPollTimers, this.persistAgents,
+				this.sessionPollTimers, this.persistAgents,
 			);
 		}
 		if (this.projectScanTimer.current) {
