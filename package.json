@@ -2,11 +2,12 @@
   "name": "pixel-agents",
   "displayName": "Pixel Agents",
   "description": "Pixel art office where your GitHub Copilot agents come to life as animated characters",
-  "version": "1.0.2",
-  "publisher": "pablodelucca",
+  "version": "1.1.0",
+  "publisher": "marcwiemann",
+  "author": "Marc Wiemann",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pablodelucca/pixel-agents"
+    "url": "https://github.com/marcwiemann/pixel-agents-copilot"
   },
   "icon": "icon.png",
   "license": "MIT",
